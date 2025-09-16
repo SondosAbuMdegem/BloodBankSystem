@@ -8,11 +8,35 @@ import xml.etree.ElementTree as ET
 from tkinter import filedialog
 import csv
 from pathlib import Path
+import os, hashlib, hmac
+
+PBKDF2_ITERATIONS = 200_000  # חוזק גיבוב סיסמא
 
 DB_PATH = "becs.db"
 
 # -------------------- Data / Rules --------------------
 BLOOD_TYPES = ["O-", "O+", "A-", "A+", "B-", "B+", "AB-", "AB+"]
+# שכיחויות באוכלוסיית ישראל (מקור הטבלה ששלחת)
+ABO_RH_PREVALENCE = {
+    "O+": 0.32, "A+": 0.34, "B+": 0.17, "AB+": 0.07,
+    "O-": 0.03, "A-": 0.04, "B-": 0.02, "AB-": 0.01,
+}
+
+def policy_sort_key(bt: str):
+    """
+    ככל שהסוג שכיח יותר — העדיפות גבוהה יותר.
+    נמיין לפי שכיחות יורדת (reverse=True).
+    """
+    return ABO_RH_PREVALENCE.get(bt, 0.0)
+
+# ---- RBAC helpers ----
+ROLES = ("admin", "user", "research")
+def is_valid_national_id(nid: str) -> bool:
+    return (nid or "").isdigit() and len(nid) == 9
+
+def is_admin(user):    return bool(user) and user.get("role") == "admin"
+def is_worker(user):   return bool(user) and user.get("role") in ("admin", "user")
+def is_research(user): return bool(user) and user.get("role") == "research"
 
 # TODO: Replace with the EXACT compatibility from your assignment doc.
 # donors_that_can_supply[recipient] -> list of donor types that can donate to 'recipient'
@@ -73,6 +97,9 @@ def init_db():
 
     # ✅ תוסיפי את זה לפני הסגירה
     ensure_audit_schema(con)
+    # ✅ HIPAA step 1: users/roles
+    ensure_user_schema(con)
+    seed_admin_if_needed(con)
 
     con.commit()
     con.close()
@@ -191,10 +218,314 @@ def ensure_audit_schema(con):
     END;
     """)
     con.commit()
-def export_all_to_csv_dir(actor: str):
-    """מייצא את כל הטבלאות לספריית CSVs ידידותית ל-Excel (קובץ לכל טבלה)."""
+
+
+def ensure_user_schema(con):
+    cur = con.cursor()
+    # טבלת Users מלאה כולל national_id ייחודי
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS Users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        role TEXT NOT NULL CHECK(role IN ('admin','user','research')),
+        password_salt BLOB NOT NULL,
+        password_hash BLOB NOT NULL,
+        created_at TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        must_reset INTEGER NOT NULL DEFAULT 0,
+        national_id TEXT NOT NULL DEFAULT '000000001'
+    )
+    """)
+
+    # מיגרציה: להוסיף עמודות חסרות
+    cur.execute("PRAGMA table_info(Users)")
+    cols = {r[1] for r in cur.fetchall()}
+    if "is_active" not in cols:
+        cur.execute("ALTER TABLE Users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    if "must_reset" not in cols:
+        cur.execute("ALTER TABLE Users ADD COLUMN must_reset INTEGER NOT NULL DEFAULT 0")
+    if "national_id" not in cols:
+        # מוסיפים בלי UNIQUE כי ALTER לא תומך ב־constraint; ניצור אינדקס ייחודי בנפרד
+        cur.execute("ALTER TABLE Users ADD COLUMN national_id TEXT")
+        # מילוי ערך ברירת מחדל למשתמש admin (אם קיים)
+        cur.execute("UPDATE Users SET national_id='000000001' WHERE username='admin' AND (national_id IS NULL OR national_id='')")
+    # אינדקס ייחודי על תעודת הזהות
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_national_id ON Users(national_id)")
+    con.commit()
+
+
+def _hash_password(password: str, salt: bytes = None):
+    if salt is None:
+        salt = os.urandom(16)
+    pw_hash = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        salt,
+        PBKDF2_ITERATIONS
+    )
+    return salt, pw_hash
+
+def _verify_password(password: str, salt: bytes, expected_hash: bytes) -> bool:
+    pw_hash = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        salt,
+        PBKDF2_ITERATIONS
+    )
+    return pw_hash == expected_hash
+
+def seed_admin_if_needed(con):
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM Users")
+    count = cur.fetchone()[0]
+    if count == 0:
+        salt, pw_hash = _hash_password("admin")
+        cur.execute("""
+            INSERT INTO Users(username, role, password_salt, password_hash, created_at, is_active, must_reset, national_id)
+            VALUES(?,?,?,?,?,?,0,?)
+        """, ("admin", "admin", salt, pw_hash, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 1, "000000001"))
+
+
+def get_user_by_username(username: str):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, username, role, password_salt, password_hash, is_active, must_reset
+        FROM Users WHERE username = ?
+    """, (username,))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "username": row[1],
+        "role": row[2],
+        "password_salt": row[3],
+        "password_hash": row[4],
+        "is_active": row[5],
+        "must_reset": row[6],
+    }
+
+def verify_user_password(username: str, password: str):
+    u = get_user_by_username(username)
+    if not u or u.get("is_active") == 0:
+        return False, None
+    ok = _verify_password(password, u["password_salt"], u["password_hash"])
+    return (ok, u if ok else None)
+def list_users():
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT
+            username,
+            role,
+            is_active,
+            created_at,
+            lower(hex(password_hash)) AS pw_hash_hex,
+            lower(hex(password_salt)) AS salt_hex,
+            national_id
+        FROM Users
+        ORDER BY username
+    """)
+    rows = cur.fetchall()
+    con.close()
+    return rows  # [(username, role, is_active, created_at, pw_hash_hex, salt_hex, national_id), ...]
+
+def create_user(*, username: str, role: str, password: str, national_id: str, actor: str):
+    if role not in ROLES:
+        raise ValueError("Invalid role")
+    username = (username or "").strip()
+    if not username:
+        raise ValueError("Username required")
+    if not password or len(password) < 8:
+        raise ValueError("Password must be at least 8 chars")
+    national_id = (national_id or "").strip()
+    if not is_valid_national_id(national_id):
+        raise ValueError("National ID must be exactly 9 digits")
+
+    con = db_conn()
+    cur = con.cursor()
+    # ייחודיות
+    cur.execute("SELECT 1 FROM Users WHERE username=?", (username,))
+    if cur.fetchone():
+        con.close()
+        raise ValueError("Username already exists")
+
+    cur.execute("SELECT 1 FROM Users WHERE national_id=?", (national_id,))
+    if cur.fetchone():
+        con.close()
+        raise ValueError("National ID already exists")
+
+    salt, pw_hash = _hash_password(password)
+    cur.execute("""
+        INSERT INTO Users(username, role, password_salt, password_hash, created_at, is_active, must_reset, national_id)
+        VALUES(?,?,?,?,?,?,0,?)
+    """, (username, role, salt, pw_hash, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 1, national_id))
+    con.commit()
+    con.close()
+
+    log_event(actor=actor, action="USER_CREATE", entity="Users",
+              success=True, new_values={"username": username, "role": role, "national_id": "***"})
+def reset_password_with_national_id(username: str, national_id: str, new_password: str) -> bool:
+    username = (username or "").strip()
+    national_id = (national_id or "").strip()
+    if not username or not is_valid_national_id(national_id):
+        raise ValueError("Invalid username or national ID")
+    if not new_password or len(new_password) < 8:
+        raise ValueError("Password must be at least 8 chars")
+
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT id, national_id FROM Users WHERE username=? AND is_active=1", (username,))
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        raise ValueError("User not found or inactive")
+    user_id, nid_db = row
+    if nid_db != national_id:
+        con.close()
+        raise ValueError("National ID does not match")
+
+    salt, pw_hash = _hash_password(new_password)
+    cur.execute("UPDATE Users SET password_salt=?, password_hash=?, must_reset=0 WHERE id=?",
+                (salt, pw_hash, user_id))
+    con.commit()
+    con.close()
+
+    # רישום ביומן עם actor = שם המשתמש (Self-service)
+    log_event(actor=username, action="PASSWORD_RESET_SELF", entity="Users",
+              success=True, note="Reset via national_id", new_values={"username": username})
+    return True
+
+def get_user_admin_view(username: str):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, username, role, is_active, created_at, national_id
+        FROM Users WHERE username=?
+    """, (username,))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "username": row[1],
+        "role": row[2],
+        "is_active": int(row[3]),
+        "created_at": row[4],
+        "national_id": row[5],
+    }
+
+def _count_active_admins(con) -> int:
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM Users WHERE role='admin' AND is_active=1")
+    return int(cur.fetchone()[0])
+
+def update_user_fields(old_username: str, *, new_username: str, role: str, is_active: int, national_id: str, actor: str):
+    new_username = (new_username or "").strip()
+    national_id = (national_id or "").strip()
+    if not new_username:
+        raise ValueError("Username required")
+    if role not in ROLES:
+        raise ValueError("Invalid role")
+    if is_active not in (0, 1):
+        raise ValueError("is_active must be 0/1")
+    if not is_valid_national_id(national_id):
+        raise ValueError("National ID must be exactly 9 digits")
+
+    con = db_conn()
+    cur = con.cursor()
+
+    # מצב נוכחי
+    cur.execute("SELECT id, username, role, is_active, created_at, national_id FROM Users WHERE username=?", (old_username,))
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        raise ValueError("User not found")
+    user_id, _cur_username, cur_role, cur_active, cur_created_at, cur_nid = row
+
+    # ייחודיות username / national_id (מלבד המשתמש עצמו)
+    cur.execute("SELECT 1 FROM Users WHERE username=? AND id<>?", (new_username, user_id))
+    if cur.fetchone():
+        con.close()
+        raise ValueError("Username already exists")
+    cur.execute("SELECT 1 FROM Users WHERE national_id=? AND id<>?", (national_id, user_id))
+    if cur.fetchone():
+        con.close()
+        raise ValueError("National ID already exists")
+
+    # הגנה: לא משביתים/מדרגים את admin הפעיל האחרון
+    if cur_role == "admin" and (role != "admin" or is_active == 0):
+        admins = _count_active_admins(con)
+        if admins <= 1:
+            con.close()
+            raise ValueError("Cannot demote/deactivate the last active admin")
+
+    old_values = {
+        "username": _cur_username, "role": cur_role, "is_active": int(cur_active),
+        "created_at": cur_created_at, "national_id": cur_nid
+    }
+    new_values = {
+        "username": new_username, "role": role, "is_active": is_active,
+        "created_at": cur_created_at, "national_id": national_id
+    }
+
+    # עדכון
+    cur.execute("""
+        UPDATE Users
+        SET username=?, role=?, is_active=?, national_id=?
+        WHERE id=?
+    """, (new_username, role, is_active, national_id, user_id))
+    con.commit()
+    con.close()
+
+    log_event(actor=actor, action="USER_UPDATE", entity="Users",
+              record_id=user_id, old_values=old_values,
+              new_values={**new_values, "national_id": "***"}, success=True)
+
+def delete_user(username: str, actor: str):
+    username = (username or "").strip()
+    if not username:
+        raise ValueError("Username required")
+
+    # לא מוחקים את עצמך
+    if username == actor:
+        raise ValueError("You cannot delete your own account")
+
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT id, role, is_active, created_at, national_id FROM Users WHERE username=?", (username,))
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        raise ValueError("User not found")
+
+    user_id, role, is_active, created_at, national_id = row
+
+    # לא מוחקים את ה־admin הפעיל האחרון
+    if role == "admin" and int(is_active) == 1:
+        admins = _count_active_admins(con)
+        if admins <= 1:
+            con.close()
+            raise ValueError("Cannot delete the last active admin")
+
+    # מחיקה
+    cur.execute("DELETE FROM Users WHERE id=?", (user_id,))
+    con.commit()
+    con.close()
+
+    log_event(actor=actor, action="USER_DELETE", entity="Users", record_id=user_id,
+              old_values={"username": username, "role": role, "is_active": int(is_active),
+                          "created_at": created_at, "national_id": "***"},
+              success=True)
+
+def export_all_to_csv_dir(actor: str, role: str):
+    """CSV לאקסל, עם הסתרת PHI אם role == 'research'."""
     if not require_operator(actor):
         return
+    from tkinter import filedialog
     d = filedialog.askdirectory(title="Choose export folder")
     if not d:
         return
@@ -206,12 +537,20 @@ def export_all_to_csv_dir(actor: str):
     con = db_conn()
     cur = con.cursor()
 
+    # בניית שאילתות לפי תפקיד
+    if role == "research":
+        donations_sql = "SELECT id, '[REDACTED]' AS donor_id, '[REDACTED]' AS donor_name, blood_type, donation_date FROM Donations"
+        audit_sql     = "SELECT id, event_time_utc, actor, action, entity, record_id, '[REDACTED]' AS old_values, '[REDACTED]' AS new_values, source, success, note FROM audit_log"
+    else:
+        donations_sql = "SELECT id, donor_id, donor_name, blood_type, donation_date FROM Donations"
+        audit_sql     = "SELECT id, event_time_utc, actor, action, entity, record_id, old_values, new_values, source, success, note FROM audit_log"
+
     tables = [
-        ("Donations", "SELECT id, donor_id, donor_name, blood_type, donation_date FROM Donations"),
+        ("Donations", donations_sql),
         ("Issues",    "SELECT id, request_type, blood_type, units, issue_date FROM Issues"),
         ("Inventory", "SELECT blood_type, units FROM Inventory"),
         ("Rarity",    "SELECT blood_type, rarity_weight FROM Rarity"),
-        ("audit_log", "SELECT id, event_time_utc, actor, action, entity, record_id, old_values, new_values, source, success, note FROM audit_log"),
+        ("audit_log", audit_sql),
     ]
 
     for name, sql in tables:
@@ -225,12 +564,12 @@ def export_all_to_csv_dir(actor: str):
 
     con.close()
     log_event(actor=actor, action="EXPORT_CSV", entity="system",
-              success=True, new_values={"dir": str(outdir)})
+              success=True, new_values={"dir": str(outdir), "role": role})
     messagebox.showinfo("Export", f"CSV files saved to:\n{outdir}")
 
 
-def export_all_to_html(actor: str):
-    """מייצא דוח HTML (RTL) נוח לקריאה ואפשר להדפיסו ל-PDF מהדפדפן."""
+def export_all_to_html(actor: str, role: str):
+    """דוח HTML ידידותי (RTl) — עם הסתרת PHI ל־research. אפשר להדפיס ל־PDF."""
     if not require_operator(actor):
         return
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -246,12 +585,19 @@ def export_all_to_html(actor: str):
     con = db_conn()
     cur = con.cursor()
 
+    if role == "research":
+        donations_sql = "SELECT id, '[REDACTED]' AS donor_id, '[REDACTED]' AS donor_name, blood_type, donation_date FROM Donations"
+        audit_sql     = "SELECT id, event_time_utc, actor, action, entity, record_id, success, note, '[REDACTED]' AS old_values, '[REDACTED]' AS new_values FROM audit_log ORDER BY id DESC"
+    else:
+        donations_sql = "SELECT id, donor_id, donor_name, blood_type, donation_date FROM Donations"
+        audit_sql     = "SELECT id, event_time_utc, actor, action, entity, record_id, success, note, old_values, new_values FROM audit_log ORDER BY id DESC"
+
     sections = [
-        ("Donations", "SELECT id, donor_id, donor_name, blood_type, donation_date FROM Donations"),
+        ("Donations", donations_sql),
         ("Issues",    "SELECT id, request_type, blood_type, units, issue_date FROM Issues"),
         ("Inventory", "SELECT blood_type, units FROM Inventory"),
         ("Rarity",    "SELECT blood_type, rarity_weight FROM Rarity"),
-        ("Audit Log", "SELECT id, event_time_utc, actor, action, entity, record_id, success, note, old_values, new_values FROM audit_log ORDER BY id DESC"),
+        ("Audit Log", audit_sql),
     ]
 
     def html_table(title, headers, rows):
@@ -291,18 +637,16 @@ def export_all_to_html(actor: str):
   table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; table-layout: fixed; }}
   th, td {{ border: 1px solid #ccc; padding: 6px; vertical-align: top; word-wrap: break-word; }}
   th {{ background: #f2f2f2; }}
-  @media print {{
-    a#print-hint {{ display: none; }}
-  }}
+  @media print {{ a#print-hint {{ display: none; }} }}
 </style>
 </head>
 <body>
   <h1>BECS – Export Report</h1>
   <div class="meta">
     Generated (Local): {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} |
-    Operator: {actor}
+    Operator: {actor} | Role: {role}
   </div>
-  <p id="print-hint">להפקת PDF: בקשי מהדפדפן <b>Print</b> → <b>Save as PDF</b>.</p>
+  <p id="print-hint">להפקת PDF: הדפסה → שמירה כ־PDF.</p>
   {''.join(parts)}
 </body>
 </html>
@@ -312,22 +656,23 @@ def export_all_to_html(actor: str):
         f.write(html)
 
     log_event(actor=actor, action="EXPORT_HTML", entity="system",
-              success=True, new_values={"file": path})
-    messagebox.showinfo("Export", f"HTML report saved.\nOpen it in a browser and Print→Save as PDF:\n{path}")
+              success=True, new_values={"file": path, "role": role})
+    messagebox.showinfo("Export", f"HTML report saved.\nOpen & Print→Save as PDF:\n{path}")
 
-def export_all_to_xml(file_path: str, actor: str):
+
+def export_all_to_xml(file_path: str, actor: str, role: str):
     """
-    מייצא את כל הטבלאות (Donations, Issues, Inventory, Rarity, audit_log) לקובץ XML אחד.
-    מחזיר dict עם ספירת שורות לכל טבלה.
+    XML אחד לכל הטבלאות; אם role == 'research' – מסתיר donor_id/donor_name ועוטף old/new בערך REDACTED.
     """
     con = db_conn()
     cur = con.cursor()
 
     root = ET.Element("becs_export", {
-        "generated_utc": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_local": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "actor": actor,
+        "role": role,
         "db_path": DB_PATH,
-        "version": "1.0"
+        "version": "1.1"
     })
 
     def add_table(name: str, query: str):
@@ -343,79 +688,591 @@ def export_all_to_xml(file_path: str, actor: str):
                 cell.text = "" if val is None else str(val)
         return len(rows)
 
+    # שאילתות עם/בלי מסוך
+    if role == "research":
+        donations_sql = "SELECT id, '[REDACTED]' AS donor_id, '[REDACTED]' AS donor_name, blood_type, donation_date FROM Donations ORDER BY id"
+        audit_sql     = "SELECT id, event_time_utc, actor, action, entity, record_id, '[REDACTED]' AS old_values, '[REDACTED]' AS new_values, source, success, note FROM audit_log ORDER BY id"
+    else:
+        donations_sql = "SELECT id, donor_id, donor_name, blood_type, donation_date FROM Donations ORDER BY id"
+        audit_sql     = "SELECT id, event_time_utc, actor, action, entity, record_id, old_values, new_values, source, success, note FROM audit_log ORDER BY id"
+
     counts = {}
-    counts["Donations"] = add_table("Donations", "SELECT * FROM Donations ORDER BY id")
-    counts["Issues"]    = add_table("Issues",    "SELECT * FROM Issues ORDER BY id")
-    counts["Inventory"] = add_table("Inventory", "SELECT * FROM Inventory ORDER BY blood_type")
-    counts["Rarity"]    = add_table("Rarity",    "SELECT * FROM Rarity ORDER BY blood_type")
-    counts["audit_log"] = add_table("audit_log", "SELECT * FROM audit_log ORDER BY id")
+    counts["Donations"] = add_table("Donations", donations_sql)
+    counts["Issues"]    = add_table("Issues",    "SELECT id, request_type, blood_type, units, issue_date FROM Issues ORDER BY id")
+    counts["Inventory"] = add_table("Inventory", "SELECT blood_type, units FROM Inventory ORDER BY blood_type")
+    counts["Rarity"]    = add_table("Rarity",    "SELECT blood_type, rarity_weight FROM Rarity ORDER BY blood_type")
+    counts["audit_log"] = add_table("audit_log", audit_sql)
 
     con.close()
 
     tree = ET.ElementTree(root)
     tree.write(file_path, encoding="utf-8", xml_declaration=True)
-
     return counts
 
 # -------------------- Suggestion Logic --------------------
 def suggest_alternative(recipient_bt, units_needed):
-    candidates = donors_that_can_supply.get(recipient_bt, [])
-    viable_full = [(t, get_stock(t)) for t in candidates if get_stock(t) >= units_needed]
-    if viable_full:
-        return min(viable_full, key=lambda x: (rarity_weight(x[0]), -x[1]))[0]
-    partials = [(t, get_stock(t)) for t in candidates if get_stock(t) > 0]
-    if partials:
-        return min(partials, key=lambda x: (rarity_weight(x[0]), -x[1]))[0]
-    return None
+    """
+    מחזיר את סוג הדם בעל העדיפות הגבוהה ביותר (לפי שכיחות באוכלוסייה)
+    מבין התורמים התואמים לרסיפיינט, כאשר יש ממנו לפחות יחידה אחת.
+    הערה: לא מציע את אותו סוג שבוקש (כדי לשמר את ההיגיון 'אין' -> חלופות).
+    """
+    cands = [bt for bt in donors_that_can_supply.get(recipient_bt, []) if bt != recipient_bt]
+    cands = [bt for bt in cands if get_stock(bt) > 0]
+    cands.sort(key=policy_sort_key, reverse=True)  # שכיח יותר קודם
+    return cands[0] if cands else None
+
+class LoginDialog(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Login")
+        self.resizable(False, False)
+        self.result = None
+
+        self.username = tk.StringVar()
+        self.password = tk.StringVar()
+
+        frm = ttk.Frame(self, padding=12)
+        frm.grid(row=0, column=0)
+
+        ttk.Label(frm, text="Username").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(frm, textvariable=self.username).grid(row=0, column=1, sticky="ew", pady=4)
+
+        ttk.Label(frm, text="Password").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(frm, textvariable=self.password, show="*").grid(row=1, column=1, sticky="ew", pady=4)
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=2, column=0, columnspan=2, pady=(8,0), sticky="e")
+        ttk.Button(btns, text="Login", command=self.try_login).pack(side="left", padx=6)
+        ttk.Button(btns, text="Quit", command=self.on_cancel).pack(side="left")
+        ttk.Button(btns, text="Forgot password?", command=self.open_reset).pack(side="left", padx=(0, 6))
+
+        frm.columnconfigure(1, weight=1)
+
+        self.bind("<Return>", lambda _e: self.try_login())
+        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        self.transient(master)
+        self.grab_set()
+        self.focus_set()
+
+    def open_reset(self):
+        ResetPasswordDialog(self)
+
+    def try_login(self):
+        u = (self.username.get() or "").strip()
+        p = self.password.get() or ""
+        ok, user = verify_user_password(u, p)
+        if ok:
+            log_event(actor=u, action="LOGIN_SUCCESS", entity="Users", success=True)
+            self.result = user   # dict: id, username, role, salts...
+            self.destroy()
+        else:
+            log_event(actor=u or "UNKNOWN", action="LOGIN_FAILED", entity="Users",
+                      success=False, note="Bad credentials")
+            messagebox.showerror("Login failed", "Wrong username or password.")
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+class ResetPasswordDialog(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Reset Password")
+        self.resizable(False, False)
+
+        self.username = tk.StringVar()
+        self.nid = tk.StringVar()
+        self.new_pw = tk.StringVar()
+        self.new_pw2 = tk.StringVar()
+
+        frm = ttk.Frame(self, padding=12)
+        frm.grid(row=0, column=0)
+
+        ttk.Label(frm, text="Username").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(frm, textvariable=self.username, width=24).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(frm, text="National ID (9 digits)").grid(row=1, column=0, sticky="w", pady=2)
+        vcmd = (self.register(lambda s: (s == "" or (s.isdigit() and len(s) <= 9))), "%P")
+        ttk.Entry(frm, textvariable=self.nid, validate="key", validatecommand=vcmd, width=24).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(frm, text="New password").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(frm, textvariable=self.new_pw, show="*", width=24).grid(row=2, column=1, sticky="w")
+
+        ttk.Label(frm, text="Confirm password").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Entry(frm, textvariable=self.new_pw2, show="*", width=24).grid(row=3, column=1, sticky="w")
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=2, pady=(8,0), sticky="e")
+        ttk.Button(btns, text="Reset", command=self.on_reset).pack(side="left", padx=6)
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="left")
+
+        self.bind("<Return>", lambda _e: self.on_reset())
+        self.transient(master)
+        self.grab_set()
+        self.focus_set()
+
+    def on_reset(self):
+        try:
+            if self.new_pw.get() != self.new_pw2.get():
+                raise ValueError("Passwords do not match")
+            reset_password_with_national_id(self.username.get(), self.nid.get(), self.new_pw.get())
+            messagebox.showinfo("Done", "Password has been reset.")
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Reset failed", str(e))
+
+class EditUserDialog(tk.Toplevel):
+    def __init__(self, master, username: str, actor: str, on_saved_callback):
+        super().__init__(master)
+        self.title(f"Edit User: {username}")
+        self.resizable(False, False)
+        self.actor = actor
+        self.on_saved = on_saved_callback
+        self.old_username = username
+
+        # טען נתונים עדכניים
+        u = get_user_admin_view(username)
+        if not u:
+            messagebox.showerror("Error", "User not found")
+            self.destroy()
+            return
+
+        self.username = tk.StringVar(value=u["username"])
+        self.role = tk.StringVar(value=u["role"])
+        self.active = tk.IntVar(value=int(u["is_active"]))
+        self.nid = tk.StringVar(value=u["national_id"])
+        created_at = u["created_at"]
+
+        frm = ttk.Frame(self, padding=12)
+        frm.grid(row=0, column=0)
+
+        ttk.Label(frm, text="Username").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(frm, textvariable=self.username, width=24).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(frm, text="Role").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Combobox(frm, textvariable=self.role, values=list(ROLES), state="readonly", width=21)\
+            .grid(row=1, column=1, sticky="w")
+
+        ttk.Label(frm, text="Active").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(frm, variable=self.active).grid(row=2, column=1, sticky="w")
+
+        ttk.Label(frm, text="National ID (9 digits)").grid(row=3, column=0, sticky="w", pady=2)
+        vcmd = (self.register(lambda s: (s == "" or (s.isdigit() and len(s) <= 9))), "%P")
+        ttk.Entry(frm, textvariable=self.nid, validate="key", validatecommand=vcmd, width=24)\
+            .grid(row=3, column=1, sticky="w")
+
+        ttk.Label(frm, text="Created At").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text=created_at).grid(row=4, column=1, sticky="w")
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=2, pady=(10,0), sticky="e")
+        ttk.Button(btns, text="Save", command=self.on_save).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left")
+
+        self.bind("<Return>", lambda _e: self.on_save())
+        self.transient(master)
+        self.grab_set()
+        self.focus_set()
+
+    def on_save(self):
+        try:
+            update_user_fields(
+                self.old_username,
+                new_username=self.username.get(),
+                role=self.role.get(),
+                is_active=int(self.active.get()),
+                national_id=self.nid.get(),
+                actor=self.actor
+            )
+            messagebox.showinfo("Saved", "User updated successfully.")
+            if callable(self.on_saved):
+                self.on_saved()
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Update failed", str(e))
+
+class ManageUsersDialog(tk.Toplevel):
+    def __init__(self, master, actor: str):
+        super().__init__(master)
+        self.title("Manage Users")
+        self.resizable(False, False)
+        self.actor = actor
+
+        wrapper = ttk.Frame(self, padding=12)
+        wrapper.grid(row=0, column=0, sticky="nsew")
+
+        # --- רשימת משתמשים ---
+        ttk.Label(wrapper, text="Existing users").grid(row=0, column=0, sticky="w")
+        self.tree = ttk.Treeview(
+            wrapper,
+            columns=("username", "role", "active", "created", "hash", "salt", "nid"),
+            show="headings",
+            height=8,
+            selectmode="browse"
+        )
+        self.tree.heading("username", text="Username")
+        self.tree.heading("role", text="Role")
+        self.tree.heading("active", text="Active")
+        self.tree.heading("created", text="Created At")
+        self.tree.heading("hash", text="Password Hash (PBKDF2)")
+        self.tree.heading("salt", text="Salt")
+        self.tree.heading("nid", text="National ID")
+
+        self.tree.column("username", width=140, anchor="w")
+        self.tree.column("role", width=90, anchor="w")
+        self.tree.column("active", width=70, anchor="center")
+        self.tree.column("created", width=150, anchor="w")
+        self.tree.column("hash", width=360, anchor="w")
+        self.tree.column("salt", width=200, anchor="w")
+        self.tree.column("nid", width=120, anchor="w")
+
+        self.tree.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(4, 6))
+
+        # סרגל פעולות לעריכה/מחיקה/רענון
+        actions = ttk.Frame(wrapper)
+        actions.grid(row=2, column=0, columnspan=3, sticky="e", pady=(0, 8))
+        ttk.Button(actions, text="Edit Selected…", command=self.on_edit).pack(side="left", padx=6)
+        ttk.Button(actions, text="Delete Selected", command=self.on_delete).pack(side="left", padx=6)
+        ttk.Button(actions, text="Refresh", command=self.reload).pack(side="left", padx=6)
+
+        self.tree.bind("<Double-1>", lambda _e: self.on_edit())
+
+        # --- טופס הוספה ---
+        sep = ttk.Separator(wrapper, orient="horizontal")
+        sep.grid(row=3, column=0, columnspan=3, sticky="ew", pady=6)
+
+        ttk.Label(wrapper, text="Add new user").grid(row=4, column=0, sticky="w", pady=(4,0))
+
+        ttk.Label(wrapper, text="Username").grid(row=5, column=0, sticky="w", pady=2)
+        self.new_username = tk.StringVar()
+        ttk.Entry(wrapper, textvariable=self.new_username, width=22).grid(row=5, column=1, sticky="w")
+
+        ttk.Label(wrapper, text="Role").grid(row=6, column=0, sticky="w", pady=2)
+        self.new_role = tk.StringVar(value="user")
+        ttk.Combobox(wrapper, textvariable=self.new_role, values=list(ROLES), state="readonly", width=19)\
+            .grid(row=6, column=1, sticky="w")
+
+        ttk.Label(wrapper, text="Password").grid(row=7, column=0, sticky="w", pady=2)
+        self.new_password = tk.StringVar()
+        ttk.Entry(wrapper, textvariable=self.new_password, show="*", width=22).grid(row=7, column=1, sticky="w")
+
+        ttk.Label(wrapper, text="National ID (9 digits)").grid(row=8, column=0, sticky="w", pady=2)
+        self.new_nid = tk.StringVar()
+        vcmd_nid = (self.register(lambda s: (s == "" or (s.isdigit() and len(s) <= 9))), "%P")
+        ttk.Entry(wrapper, textvariable=self.new_nid, validate="key", validatecommand=vcmd_nid, width=22)\
+            .grid(row=8, column=1, sticky="w")
+
+        ttk.Button(wrapper, text="Add User", command=self.on_add).grid(row=9, column=1, sticky="e", pady=(8, 0))
+
+        wrapper.columnconfigure(2, weight=1)
+        self.reload()
+
+        self.bind("<Return>", lambda _e: self.on_add())
+        self.transient(master)
+        self.grab_set()
+        self.focus_set()
+
+    def reload(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        for username, role, is_active, created_at, pw_hash_hex, salt_hex, national_id in list_users():
+            self.tree.insert(
+                "",
+                "end",
+                values=(username, role, "Yes" if is_active else "No", created_at, pw_hash_hex, salt_hex, national_id)
+            )
+
+    def _selected_username(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Please select a user first.")
+            return None
+        vals = self.tree.item(sel[0], "values")
+        return vals[0]  # username
+
+    def on_edit(self):
+        uname = self._selected_username()
+        if not uname:
+            return
+        # פותחים דיאלוג עריכה
+        EditUserDialog(self, uname, self.actor, on_saved_callback=self.reload)
+
+    def on_delete(self):
+        uname = self._selected_username()
+        if not uname:
+            return
+        if messagebox.askyesno("Confirm delete", f"Delete user '{uname}'? This cannot be undone."):
+            try:
+                delete_user(uname, self.actor)
+                messagebox.showinfo("Deleted", f"User '{uname}' deleted.")
+                self.reload()
+            except Exception as e:
+                messagebox.showerror("Delete failed", str(e))
+
+    def on_add(self):
+        try:
+            create_user(
+                username=self.new_username.get(),
+                role=self.new_role.get(),
+                password=self.new_password.get(),
+                national_id=self.new_nid.get(),
+                actor=self.actor
+            )
+            messagebox.showinfo("User created", "User added successfully.")
+            self.new_username.set("")
+            self.new_password.set("")
+            self.new_role.set("user")
+            self.new_nid.set("")
+            self.reload()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+class InventoryViewTab(ttk.Frame):
+    """תצוגת מלאי קריאה בלבד לחוקר/סטודנט."""
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        ttk.Label(self, text="Inventory (read-only)", font=("TkDefaultFont", 10, "bold"))\
+            .pack(anchor="w", padx=8, pady=(10, 4))
+
+        self.tree = ttk.Treeview(self, columns=("bt", "units"), show="headings", height=10)
+        self.tree.heading("bt", text="Blood Type")
+        self.tree.heading("units", text="Units")
+        self.tree.column("bt", width=100, anchor="center")
+        self.tree.column("units", width=120, anchor="e")
+        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Refresh", command=self.refresh).pack(side="left")
+
+        self.refresh()
+
+    def refresh(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        for bt in BLOOD_TYPES:
+            self.tree.insert("", "end", values=(bt, get_stock(bt)))
+class DonorReportTab(ttk.Frame):
+    """דוח תורמים: שם, ת״ז, סוג דם, תאריך, וכמה מנות נתרמו (קיבוץ לפי תאריך+תורם)."""
+    def __init__(self, parent, status_var):
+        super().__init__(parent)
+        self.status_var = status_var
+
+        ttk.Label(self, text="Donations by Donor & Date",
+                  font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 4))
+
+        cols = ("donor_name", "donor_id", "blood_type", "donation_date", "units")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12)
+        self.tree.heading("donor_name", text="Donor Name")
+        self.tree.heading("donor_id", text="National ID")
+        self.tree.heading("blood_type", text="Blood Type")
+        self.tree.heading("donation_date", text="Date")
+        self.tree.heading("units", text="Units")
+
+        self.tree.column("donor_name", width=200, anchor="w")
+        self.tree.column("donor_id", width=120, anchor="center")
+        self.tree.column("blood_type", width=90, anchor="center")
+        self.tree.column("donation_date", width=120, anchor="center")
+        self.tree.column("units", width=80, anchor="e")
+
+        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Refresh", command=self.reload).pack(side="left")
+
+        self.reload()
+
+    def reload(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+
+        con = db_conn()
+        cur = con.cursor()
+        cur.execute("""
+            SELECT donor_name, donor_id, blood_type, donation_date, COUNT(*) AS units
+            FROM Donations
+            GROUP BY donor_name, donor_id, blood_type, donation_date
+            ORDER BY date(donation_date) DESC, donor_name
+        """)
+        rows = cur.fetchall()
+        con.close()
+
+        for r in rows:
+            self.tree.insert("", "end", values=r)
+
+        self.status_var.set(f"Loaded {len(rows)} donation group(s).")
+class IssuedByUserReportTab(ttk.Frame):
+    """
+    דו״ח הנפקות לפי משתמש (USER): שם משתמש, ת״ז, סוג דם, כמות, תאריך.
+    נשען על audit_log (ISSUE_ROUTINE / ISSUE_MCI) וממפה actor -> Users.username כדי להביא national_id.
+    """
+    def __init__(self, parent, status_var):
+        super().__init__(parent)
+        self.status_var = status_var
+
+        ttk.Label(self, text="Issued Units by Users",
+                  font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 4))
+
+        cols = ("username", "national_id", "request_type", "blood_type", "units", "issue_date")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12)
+
+        self.tree.heading("username", text="User")
+        self.tree.heading("national_id", text="National ID")
+        self.tree.heading("request_type", text="Type")
+        self.tree.heading("blood_type", text="Blood Type")
+        self.tree.heading("units", text="Units")
+        self.tree.heading("issue_date", text="Date")
+
+        self.tree.column("username", width=160, anchor="w")
+        self.tree.column("national_id", width=120, anchor="center")
+        self.tree.column("request_type", width=90, anchor="center")
+        self.tree.column("blood_type", width=90, anchor="center")
+        self.tree.column("units", width=70, anchor="e")
+        self.tree.column("issue_date", width=120, anchor="center")
+
+        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Refresh", command=self.reload).pack(side="left")
+
+        self.reload()
+
+    def reload(self):
+        # נקה טבלה
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+
+        con = db_conn()
+        cur = con.cursor()
+        # לוקחים רק הנפקות מוצלחות ומצמידים ת״ז מה־Users
+        cur.execute("""
+            SELECT al.event_time_utc, al.actor, IFNULL(u.national_id,'') AS nid, al.action, al.new_values
+            FROM audit_log AS al
+            LEFT JOIN Users AS u ON u.username = al.actor
+            WHERE al.entity = 'Issues'
+              AND al.success = 1
+              AND al.action IN ('ISSUE_ROUTINE','ISSUE_MCI')
+            ORDER BY al.id DESC
+        """)
+        rows = cur.fetchall()
+        con.close()
+
+        total = 0
+        for event_time_utc, actor, nid, action, new_vals in rows:
+            # פריסה בטוחה של ה־JSON
+            try:
+                nv = json.loads(new_vals) if new_vals else {}
+            except Exception:
+                nv = {}
+
+            bt    = nv.get("blood_type", "")
+            units = nv.get("units", "")
+            date_str = nv.get("issue_date", (event_time_utc.split(" ")[0] if event_time_utc else ""))
+
+            req_type = "mci" if action == "ISSUE_MCI" else "routine"
+
+            self.tree.insert("", "end", values=(actor, nid, req_type, bt, units, date_str))
+            try:
+                total += int(units)
+            except Exception:
+                pass
+
+        self.status_var.set(f"Loaded {len(rows)} issue record(s). Total units: {total}")
 
 # -------------------- GUI --------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.RELOGIN = False  # ברירת מחדל: לא להתאתחל מחדש
         self.title("BECS - Blood Establishment Computer Software")
         self.geometry("720x460")
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True)
+        # ---- Login (חובה לפני הכל) ----
+        self.current_user = None
+        dlg = LoginDialog(self)
+        self.wait_window(dlg)
+        if not dlg.result:
+            # המשתמש סגר/ביטל
+            self.destroy()
+            return
+        self.current_user = dlg.result  # dict: {username, role, ...}
 
+        # ---- Status bar ----
         self.status = tk.StringVar(value="Ready.")
         status_bar = ttk.Label(self, textvariable=self.status, anchor="w")
         status_bar.pack(fill="x", side="bottom")
 
-        # ---- Operator ID (מזהה מפעיל) למעלה ----
-        self.operator_id_var = tk.StringVar(value="")
+        # ---- פס עליון: מי מחובר ----
         topbar = ttk.Frame(self)
         topbar.pack(fill="x", side="top", padx=8, pady=6)
-        ttk.Label(topbar, text="Operator ID:").pack(side="left")
-        ttk.Entry(topbar, textvariable=self.operator_id_var, width=22).pack(side="left", padx=6)
-        # -----------------------------------------
+        ttk.Label(
+            topbar,
+            text=f"Logged in: {self.current_user['username']} ({self.current_user['role']})"
+        ).pack(side="left")
+        ttk.Button(topbar, text="Logout", command=self.logout).pack(side="right")
 
-        self.donations_tab = DonationsTab(nb, self.status, self.get_actor)
-        self.routine_tab = RoutineIssueTab(nb, self.status, self.get_actor)
-        self.mci_tab = MCITab(nb, self.status, self.get_actor)
+        # ---- הטאבים ----
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True)
 
-        nb.add(self.donations_tab, text="Donations")
-        nb.add(self.routine_tab, text="Routine Issue")
-        nb.add(self.mci_tab, text="Emergency (MCI)")
-        self.audit_tab = AuditLogTab(nb, self.status)
-        nb.add(self.audit_tab, text="Audit Log")
-        self.export_tab = ExportTab(nb, self.status, self.get_actor)
-        nb.add(self.export_tab, text="Export")
+        role = self.current_user["role"]
 
-        # --- Menu: File → Export ---
-        menubar = tk.Menu(self)
-        filemenu = tk.Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Export CSV (Excel)…",
-                             command=lambda: export_all_to_csv_dir(self.get_actor()))
-        filemenu.add_command(label="Export HTML (for PDF)…",
-                             command=lambda: export_all_to_html(self.get_actor()))
-        menubar.add_cascade(label="File", menu=filemenu)
-        self.config(menu=menubar)
-        # ---------------------------
+        if role == "research":
+            # חוקר/סטודנט: דף אחד בלבד – תצוגת מלאי (קריאה בלבד)
+            self.inv_view = InventoryViewTab(nb)
+            nb.add(self.inv_view, text="Inventory View")
+        else:
+            # עובד/אדמין
+            if is_worker(self.current_user):
+                self.donations_tab = DonationsTab(nb, self.status, self.get_actor)
+                nb.add(self.donations_tab, text="Donations")
+
+            self.routine_tab = RoutineIssueTab(nb, self.status, self.get_actor)
+            nb.add(self.routine_tab, text="Routine Issue")
+
+            self.mci_tab = MCITab(nb, self.status, self.get_actor)
+            nb.add(self.mci_tab, text="Emergency (MCI)")
+
+            # רק אדמין רואה Audit + Export + תפריט ניהול
+            if is_admin(self.current_user):
+                self.audit_tab = AuditLogTab(nb, self.status)
+                nb.add(self.audit_tab, text="Audit Log")
+
+                self.export_tab = ExportTab(
+                    nb, self.status, self.get_actor,
+                    role_getter=lambda: self.current_user["role"]
+                )
+                nb.add(self.export_tab, text="Export")
+                # דו״ח הנפקות לפי משתמש (רק אדמין)
+                self.issued_by_user_tab = IssuedByUserReportTab(nb, self.status)
+                nb.add(self.issued_by_user_tab, text="Issued by Users")
+
+                self.donor_report_tab = DonorReportTab(nb, self.status)
+                nb.add(self.donor_report_tab, text="Donor Report")
+                menubar = tk.Menu(self)
+                adminmenu = tk.Menu(menubar, tearoff=0)
+                adminmenu.add_command(
+                    label="Manage Users…",
+                    command=lambda: ManageUsersDialog(self, self.get_actor())
+                )
+                menubar.add_cascade(label="Admin", menu=adminmenu)
+                self.config(menu=menubar)
+
 
     def get_actor(self):
-        v = (self.operator_id_var.get() or "").strip()
-        return v if v else "UNKNOWN"
+        # עכשיו ה־actor הוא שם המשתמש המחובר (ולא תיבת טקסט למעלה)
+        return self.current_user["username"] if self.current_user else "UNKNOWN"
+
+    def logout(self):
+        user = self.current_user["username"] if self.current_user else "UNKNOWN"
+        if messagebox.askyesno("Logout", f"Log out {user}?"):
+            log_event(actor=user, action="LOGOUT", entity="Users", success=True)
+            # סימון שנרצה להפעיל מחדש את מסך ההתחברות
+            self.RELOGIN = True
+            self.destroy()
 
 
 class DonationsTab(ttk.Frame):
@@ -477,16 +1334,17 @@ class DonationsTab(ttk.Frame):
         bt = self.bt.get().strip()
         dt = self.dt.get().strip()
         did = self.donor_id.get().strip()
+        dname = self.donor_name.get().strip()
+
+        actor = self.actor_getter()  # מזהה מפעיל ליומן
+        if not require_operator(actor):
+            return
+
         # דרישה: בדיוק 9 ספרות
         if not (did.isdigit() and len(did) == 9):
             messagebox.showerror("Error", "Donor ID must be exactly 9 digits.")
             log_event(actor=actor, action="DONATION_CREATE", entity="Donations",
                       success=False, note="Invalid donor_id (must be 9 digits)")
-            return
-
-        dname = self.donor_name.get().strip()
-        actor = self.actor_getter()  # מזהה מפעיל ליומן
-        if not require_operator(actor):
             return
 
         if not (bt and dt and did and dname):
@@ -538,16 +1396,15 @@ class DonationsTab(ttk.Frame):
         self.refresh_stock()
         self.status_var.set(f"Added 1 unit of {bt}. Stock now {after_units}.")
 
-
 class RoutineIssueTab(ttk.Frame):
     def __init__(self, parent, status_var, actor_getter):
         super().__init__(parent)
         self.status_var = status_var
         self.actor_getter = actor_getter
 
-
         self.req_bt = tk.StringVar(value=BLOOD_TYPES[0])
         self.units_needed = tk.IntVar(value=1)
+        self.last_checked = None  # (bt, n) מהעברתה האחרונה
 
         row = 0
         ttk.Label(self, text="Requested Blood Type").grid(row=row, column=0, sticky="w", padx=8, pady=6)
@@ -555,137 +1412,343 @@ class RoutineIssueTab(ttk.Frame):
 
         row += 1
         ttk.Label(self, text="Units Needed").grid(row=row, column=0, sticky="w", padx=8, pady=6)
-        ttk.Spinbox(self, from_=1, to=999, textvariable=self.units_needed, width=8).grid(row=row, column=1, sticky="w", padx=8)
+        ttk.Spinbox(self, from_=1, to=999, textvariable=self.units_needed, width=8)\
+            .grid(row=row, column=1, sticky="w", padx=8)
 
         row += 1
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=row, column=0, columnspan=2, pady=8)
-        ttk.Button(btn_frame, text="Check & Issue", command=self.check_and_issue).pack(side="left", padx=6)
-        ttk.Button(btn_frame, text="Suggest Alternative", command=self.do_suggest).pack(side="left", padx=6)
+
+        # כפתור קבוע: Check
+        ttk.Button(btn_frame, text="Check", command=self.check_availability).pack(side="left", padx=6)
+
+        # כפתורים דינמיים: אחד מהם יוצג רק אחרי בדיקה
+        self.issue_btn   = ttk.Button(btn_frame, text="Issue", command=self.issue_now)
+        self.suggest_btn = ttk.Button(btn_frame, text="Suggest Alternative", command=self.do_suggest_modal)
+        # לא עושים pack כאן – נציג לפי תוצאת הבדיקה
 
         row += 1
         self.result = tk.StringVar()
         ttk.Label(self, textvariable=self.result, foreground="blue").grid(row=row, column=0, columnspan=2, sticky="w", padx=8)
+        # <<< ADD: אזור לפאנלי חלופה אופציונליים (inline / quick buttons)
+        row += 1
+        self.alt_panel = ttk.Frame(self)
+        self.alt_panel.grid(row=row, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 0))
+        self.alt_panel.grid_remove()
+
+        row += 1
+        self.quick_panel = ttk.Frame(self)
+        self.quick_panel.grid(row=row, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 0))
+        self.quick_panel.grid_remove()
 
         self.grid_columnconfigure(1, weight=1)
 
-    def check_and_issue(self):
+        # שינוי קלט מאפס את המצב – מסתיר כפתורים
+        self.req_bt.trace_add("write", lambda *_: self._reset_after_change())
+        self.units_needed.trace_add("write", lambda *_: self._reset_after_change())
+    # <<< ADD: מחשב רשימת חלופות ממוספרת וממוינת
+    def _compute_candidates(self, req_bt, units_needed):
+        # חלופות תואמות, ללא הסוג המבוקש עצמו
+        raw = [bt for bt in donors_that_can_supply.get(req_bt, []) if bt != req_bt]
+
+        # רק כאלה שיש מהם מלאי
+        raw = [bt for bt in raw if get_stock(bt) > 0]
+
+        # סדר עדיפות לפי שכיחות באוכלוסייה (גבוה->נמוך)
+        raw.sort(key=policy_sort_key, reverse=True)
+
+        # בונים טבלה להצגה: (סוג, מלאי, דירוג, האם מכסה את כל הכמות)
+        out = []
+        for rank, bt in enumerate(raw, start=1):
+            stock = get_stock(bt)
+            is_full = stock >= units_needed
+            out.append((bt, stock, rank, is_full))
+        return out
+
+    # <<< ADD: ווריאנט מודאלי
+    def do_suggest_modal(self):
+        self._clear_alt_ui()
         bt = self.req_bt.get()
-        n = self.units_needed.get()
+        n = int(self.units_needed.get() or 0)
         actor = self.actor_getter()
         if not require_operator(actor):
             return
+        cands = self._compute_candidates(bt, n)
+        if not cands:
+            messagebox.showwarning("Suggestion", "No compatible alternative available.")
+            log_event(actor=actor, action="ISSUE_SUGGEST", entity="Issues",
+                      new_values={"requested_bt": bt, "requested_units": n},
+                      success=False, note="No alternative")
+            return
+        dlg = AlternativeDialog(self, cands, n)
+        self.wait_window(dlg)
+        if dlg.result:
+            alt_bt, alt_n = dlg.result
+            self._issue_specific(alt_bt, alt_n, requested_from=bt)
+        else:
+            # ביטול
+            pass
 
+    # <<< ADD: איפוס רכיבי UI חלופיים (אם קיימים)
+    def _clear_alt_ui(self):
+        # פאנל inline
+        if hasattr(self, "alt_panel") and self.alt_panel.winfo_exists():
+            for w in self.alt_panel.winfo_children():
+                w.destroy()
+            self.alt_panel.grid_remove()
+        # קומבו+כפתור
+        if hasattr(self, "alt_combo") and self.alt_combo.winfo_exists():
+            self.alt_combo.pack_forget()
+        if hasattr(self, "alt_issue_btn") and self.alt_issue_btn.winfo_exists():
+            self.alt_issue_btn.pack_forget()
+        # פאנל כפתורי-בזק
+        if hasattr(self, "quick_panel") and self.quick_panel.winfo_exists():
+            for w in self.quick_panel.winfo_children():
+                w.destroy()
+            self.quick_panel.grid_remove()
+
+    # <<< ADD: הנפקת סוג דם וכמות ספציפיים (גם לחלופין)
+    def _issue_specific(self, bt, n, requested_from=None):
+        actor = self.actor_getter()
+        if not require_operator(actor):
+            return
+        try:
+            n = int(n)
+        except Exception:
+            messagebox.showerror("Error", "Units must be a positive integer.")
+            return
         if n <= 0:
             messagebox.showerror("Error", "Units must be positive.")
-            log_event(actor=actor, action="ISSUE_ROUTINE", entity="Issues",
-                      success=False, note="Units must be positive")
             return
 
         before_units = get_stock(bt)
+        if before_units < n:
+            messagebox.showerror("Insufficient", f"Only {before_units} unit(s) of {bt} in stock.")
+            log_event(actor=actor, action="ISSUE_ROUTINE", entity="Issues",
+                      success=False,
+                      old_values={"blood_type": bt, "requested": n, "stock": before_units},
+                      note=f"ALT issue failed (requested_from={requested_from or self.req_bt.get()})")
+            return
 
-        if before_units >= n:
-            # עודכן מלאי
-            take_stock(bt, n)
-            after_units = get_stock(bt)
+        # ניפוק + רישום
+        take_stock(bt, n)
+        after_units = get_stock(bt)
+        con = db_conn()
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO Issues(request_type, blood_type, units, issue_date) VALUES('routine', ?, ?, ?)",
+            (bt, n, str(date.today()))
+        )
+        issue_id = cur.lastrowid
+        con.commit()
+        con.close()
 
-            # יצירת רשומת Issue
-            con = db_conn()
-            cur = con.cursor()
-            cur.execute(
-                "INSERT INTO Issues(request_type, blood_type, units, issue_date) VALUES('routine', ?, ?, ?)",
-                (bt, n, str(date.today()))
-            )
-            issue_id = cur.lastrowid
-            con.commit()
-            con.close()
+        log_event(actor=actor, action="ISSUE_ROUTINE", entity="Issues",
+                  record_id=issue_id,
+                  new_values={"blood_type": bt, "units": n, "issue_date": str(date.today()),
+                              "requested_from": requested_from or self.req_bt.get()},
+                  success=True, note="ALT or direct issue")
+        log_event(actor=actor, action="INVENTORY_UPDATE", entity="Inventory",
+                  record_id=bt,
+                  old_values={"blood_type": bt, "units": before_units},
+                  new_values={"blood_type": bt, "units": after_units},
+                  success=True)
 
-            # Audit: ניפוק מוצלח
-            log_event(
-                actor=actor,
-                action="ISSUE_ROUTINE",
-                entity="Issues",
-                record_id=issue_id,
-                new_values={"blood_type": bt, "units": n, "issue_date": str(date.today())},
-                success=True
-            )
-            # Audit: עדכון מלאי
-            log_event(
-                actor=actor,
-                action="INVENTORY_UPDATE",
-                entity="Inventory",
-                record_id=bt,
-                old_values={"blood_type": bt, "units": before_units},
-                new_values={"blood_type": bt, "units": after_units},
-                success=True
-            )
+        self.result.set(f"Issued {n} unit(s) of {bt}. Remaining: {after_units}")
+        self.status_var.set(self.result.get())
+        self._reset_after_change()
+        self._clear_alt_ui()
 
-            self.result.set(f"Issued {n} unit(s) of {bt}. Remaining: {after_units}")
-            self.status_var.set(self.result.get())
-        else:
-            # אין מספיק מלאי
-            log_event(
-                actor=actor,
-                action="ISSUE_ATTEMPT",
-                entity="Issues",
-                old_values={"blood_type": bt, "requested": n, "stock": before_units},
-                success=False,
-                note="Insufficient stock"
-            )
+    # עוזרים להצגה/הסתרה
+    def _show_issue(self):
+        try: self.suggest_btn.pack_forget()
+        except Exception: pass
+        if not self.issue_btn.winfo_ismapped():
+            self.issue_btn.pack(side="left", padx=6)
 
-            alt = suggest_alternative(bt, n)
-            if alt:
-                self.result.set(f"Insufficient {bt}. Suggested alternative: {alt} (stock {get_stock(alt)}).")
-                self.status_var.set(self.result.get())
-                log_event(
-                    actor=actor,
-                    action="ISSUE_SUGGEST",
-                    entity="Issues",
-                    new_values={"requested_bt": bt, "requested_units": n,
-                                "suggested_bt": alt, "suggested_stock": get_stock(alt)},
-                    success=True
-                )
-            else:
-                self.result.set(f"Insufficient {bt}. No compatible alternative available.")
-                self.status_var.set(self.result.get())
-                log_event(
-                    actor=actor,
-                    action="ISSUE_SUGGEST",
-                    entity="Issues",
-                    new_values={"requested_bt": bt, "requested_units": n},
-                    success=False,
-                    note="No compatible alternative"
-                )
+    def _show_suggest(self):
+        try: self.issue_btn.pack_forget()
+        except Exception: pass
+        if not self.suggest_btn.winfo_ismapped():
+            self.suggest_btn.pack(side="left", padx=6)
 
-    def do_suggest(self):
+    def _reset_after_change(self):
+        for b in (self.issue_btn, self.suggest_btn):
+            try: b.pack_forget()
+            except Exception: pass
+        self.last_checked = None
+
+    # שלב 1: בדיקה בלבד
+    def check_availability(self):
         bt = self.req_bt.get()
-        n = self.units_needed.get()
+        n = int(self.units_needed.get() or 0)
         actor = self.actor_getter()
         if not require_operator(actor):
             return
+        if n <= 0:
+            messagebox.showerror("Error", "Units must be positive.")
+            log_event(actor=actor, action="ISSUE_CHECK", entity="Issues",
+                      success=False, note="Units must be positive")
+            return
 
+        stock = get_stock(bt)
+        if stock >= n:
+            self.result.set(f"✅ Available: {n} unit(s) of {bt} (stock {stock}). Click 'Issue' to proceed.")
+            self.status_var.set(self.result.get())
+            self._show_issue()
+            self.last_checked = (bt, n)
+            log_event(actor=actor, action="ISSUE_CHECK", entity="Issues",
+                      success=True, new_values={"blood_type": bt, "units": n, "stock": stock})
+        else:
+            self.result.set(
+                f"❌ Insufficient {bt}. Requested {n}, stock {stock}. Click 'Suggest Alternative' to use the top-priority compatible type.")
+            self.status_var.set(self.result.get())
+            self._show_suggest()
+            self.last_checked = None
+            log_event(actor=actor, action="ISSUE_CHECK", entity="Issues",
+                      success=False, old_values={"blood_type": bt, "requested": n, "stock": stock},
+                      note="Insufficient stock")
+
+    # שלב 2: ניפוק בפועל (רק אם הבדיקה הצליחה ולא השתנו קלטים)
+    def issue_now(self):
+        bt = self.req_bt.get()
+        n = int(self.units_needed.get() or 0)
+        actor = self.actor_getter()
+        if not require_operator(actor):
+            return
+        if self.last_checked != (bt, n):
+            messagebox.showwarning("Check first", "Inputs changed. Please run 'Check' again.")
+            self._reset_after_change()
+            return
+
+        before_units = get_stock(bt)
+        if before_units < n:
+            messagebox.showerror("Insufficient", "Stock changed. Please check again.")
+            log_event(actor=actor, action="ISSUE_ROUTINE", entity="Issues",
+                      success=False, note="Stock changed before issue",
+                      old_values={"blood_type": bt, "requested": n, "stock": before_units})
+            self._reset_after_change()
+            return
+
+        take_stock(bt, n)
+        after_units = get_stock(bt)
+        con = db_conn()
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO Issues(request_type, blood_type, units, issue_date) VALUES('routine', ?, ?, ?)",
+            (bt, n, str(date.today()))
+        )
+        issue_id = cur.lastrowid
+        con.commit()
+        con.close()
+
+        log_event(actor=actor, action="ISSUE_ROUTINE", entity="Issues",
+                  record_id=issue_id,
+                  new_values={"blood_type": bt, "units": n, "issue_date": str(date.today())},
+                  success=True)
+        log_event(actor=actor, action="INVENTORY_UPDATE", entity="Inventory",
+                  record_id=bt,
+                  old_values={"blood_type": bt, "units": before_units},
+                  new_values={"blood_type": bt, "units": after_units},
+                  success=True)
+
+        self.result.set(f"Issued {n} unit(s) of {bt}. Remaining: {after_units}")
+        self.status_var.set(self.result.get())
+        self._reset_after_change()
+
+    # מציג הצעה כשאין מלאי מתאים
+    def do_suggest(self):
+        bt = self.req_bt.get()
+        n = int(self.units_needed.get() or 0)
+        actor = self.actor_getter()
+        if not require_operator(actor):
+            return
         alt = suggest_alternative(bt, n)
         if alt:
             messagebox.showinfo("Suggestion", f"Alternative: {alt} (stock {get_stock(alt)})")
-            log_event(
-                actor=actor,
-                action="ISSUE_SUGGEST",
-                entity="Issues",
-                new_values={"requested_bt": bt, "requested_units": n,
-                            "suggested_bt": alt, "suggested_stock": get_stock(alt)},
-                success=True,
-                note="Manual suggest"
-            )
+            log_event(actor=actor, action="ISSUE_SUGGEST", entity="Issues",
+                      new_values={"requested_bt": bt, "requested_units": n,
+                                  "suggested_bt": alt, "suggested_stock": get_stock(alt)},
+                      success=True, note="Manual suggest")
         else:
             messagebox.showwarning("Suggestion", "No compatible alternative available.")
-            log_event(
-                actor=actor,
-                action="ISSUE_SUGGEST",
-                entity="Issues",
-                new_values={"requested_bt": bt, "requested_units": n},
-                success=False,
-                note="Manual suggest: no alternative"
-            )
+            log_event(actor=actor, action="ISSUE_SUGGEST", entity="Issues",
+                      new_values={"requested_bt": bt, "requested_units": n},
+                      success=False, note="Manual suggest: no alternative")
+
+class AlternativeDialog(tk.Toplevel):
+    def __init__(self, master, candidates, units_requested):
+        super().__init__(master)
+        self.title("Choose Alternative (Policy)")
+        self.resizable(False, False)
+        self.result = None  # (bt, units)
+
+        # first/only permitted type:
+        if not candidates:
+            ttk.Label(self, text="No compatible alternatives in stock.").pack(padx=10, pady=10)
+            ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0,10))
+            self.transient(self.master); self.grab_set(); self.focus_set()
+            return
+
+        self.top_bt   = candidates[0][0]
+        self.top_stock= candidates[0][1]
+
+        ttk.Label(
+            self,
+            text=f"ניתן להנפיק רק מסוג העדיפות הראשונה: {self.top_bt} (מלאי {self.top_stock})"
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+
+        self.tree = ttk.Treeview(self, columns=("bt","stock","rank","full"), show="headings", height=7)
+        for c, w, a in (("bt",120,"center"), ("stock",70,"e"), ("rank",70,"e"), ("full",70,"center")):
+            self.tree.heading(c, text=c.upper())
+            self.tree.column(c, width=w, anchor=a)
+        for bt, stock, rank, is_full in candidates:
+            self.tree.insert("", "end", values=(bt, stock, rank, "Full" if is_full else "Partial"))
+        self.tree.pack(fill="both", expand=True, padx=10)
+
+        # בוחרים את הראשונה כברירת מחדל
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.selection_set(kids[0])
+
+        frm = ttk.Frame(self); frm.pack(fill="x", padx=10, pady=10)
+        ttk.Label(frm, text="Units to issue").pack(side="left")
+        self.n_var = tk.IntVar(value=min(units_requested, self.top_stock if self.top_stock>0 else units_requested))
+        self.spin  = ttk.Spinbox(frm, from_=1, to=max(1, self.top_stock), textvariable=self.n_var, width=6)
+        self.spin.pack(side="left", padx=8)
+
+        btns = ttk.Frame(self); btns.pack(fill="x", padx=10, pady=(0,10))
+        ttk.Button(btns, text="Issue",  command=self.on_issue).pack(side="right", padx=6)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+
+        self.transient(self.master)
+        self.grab_set()
+        self.focus_set()
+
+    def on_issue(self):
+        # אוכפים הנפקה רק מהסוג הראשון
+        sel = self.tree.selection()
+        if not sel:
+            return
+        chosen_bt = self.tree.item(sel[0], "values")[0]
+        if chosen_bt != self.top_bt:
+            messagebox.showwarning("Policy",
+                                   f"You may issue only from the top-priority type: {self.top_bt}.")
+            return
+        try:
+            n = int(self.n_var.get())
+        except Exception:
+            messagebox.showerror("Error", "Units must be a positive integer.")
+            return
+        if n <= 0:
+            messagebox.showerror("Error", "Units must be positive.")
+            return
+        if n > self.top_stock:
+            messagebox.showerror("Error", f"Max available for {self.top_bt} is {self.top_stock}.")
+            return
+
+        self.result = (self.top_bt, n)
+        self.destroy()
 
 
 class MCITab(ttk.Frame):
@@ -848,41 +1911,34 @@ class AuditLogTab(ttk.Frame):
         self.details_txt.insert("end", "NEW VALUES:\n")
         self.details_txt.insert("end", new_v)
 class ExportTab(ttk.Frame):
-    """טאב ייצוא של כל הרשומות: XML + CSV + HTML (להדפסה ל-PDF)."""
-    def __init__(self, parent, status_var, actor_getter):
+    """טאב ייצוא של כל הרשומות: XML + CSV + HTML (להדפסה ל-PDF) עם מסוך PHI ל-research."""
+    def __init__(self, parent, status_var, actor_getter, role_getter):
         super().__init__(parent)
         self.status_var = status_var
         self.actor_getter = actor_getter
+        self.role_getter  = role_getter  # <<< חדש
 
-        # כותרת והסבר
         title = ttk.Label(self, text="Export all records", font=("TkDefaultFont", 10, "bold"))
         title.pack(anchor="w", padx=8, pady=(10, 4))
         info = ttk.Label(self, text="Create portable copies of all tables (Donations, Issues, Inventory, Rarity, audit_log).")
         info.pack(anchor="w", padx=8)
 
-        # --- XML ---
         ttk.Label(self, text="XML").pack(anchor="w", padx=8, pady=(10, 0))
         ttk.Button(self, text="Export (XML)", command=self.do_export_xml).pack(anchor="w", padx=8, pady=6)
 
-        # --- CSV (Excel) ---
         ttk.Label(self, text="CSV (Excel)").pack(anchor="w", padx=8)
-        ttk.Button(
-            self,
-            text="Export CSV (Excel)…",
-            command=lambda: export_all_to_csv_dir(self.actor_getter())
+        ttk.Button(self, text="Export CSV (Excel)…",
+                   command=lambda: export_all_to_csv_dir(self.actor_getter(), self.role_getter())
         ).pack(anchor="w", padx=8, pady=6)
 
-        # --- HTML (להמרה קלה ל-PDF דרך הדפדפן) ---
         ttk.Label(self, text="HTML / Print to PDF").pack(anchor="w", padx=8)
-        ttk.Button(
-            self,
-            text="Export HTML (for PDF)…",
-            command=lambda: export_all_to_html(self.actor_getter())
+        ttk.Button(self, text="Export HTML (for PDF)…",
+                   command=lambda: export_all_to_html(self.actor_getter(), self.role_getter())
         ).pack(anchor="w", padx=8, pady=6)
 
-    # השארתי את הלוגיקה של XML כפי שהייתה אצלך, רק שיניתי שם פונקציה לקריאות
     def do_export_xml(self):
         actor = self.actor_getter()
+        role  = self.role_getter()
         if not require_operator(actor):
             return
 
@@ -895,11 +1951,10 @@ class ExportTab(ttk.Frame):
         )
         if not path:
             return
-
         try:
-            counts = export_all_to_xml(path, actor)
+            counts = export_all_to_xml(path, actor, role)
             log_event(actor=actor, action="EXPORT_XML", entity="export",
-                      success=True, note=path, new_values={"counts": counts})
+                      success=True, note=path, new_values={"counts": counts, "role": role})
             self.status_var.set(f"Exported XML to {path}")
             messagebox.showinfo(
                 "Export complete",
@@ -916,6 +1971,13 @@ class ExportTab(ttk.Frame):
 # -------------------- Main --------------------
 if __name__ == "__main__":
     init_db()
-    app = App()
-    app.mainloop()
+    while True:
+        app = App()
+        app.mainloop()
+        # אם המשתמש לחץ Logout – נפתח שוב את App (שיאתחל דיאלוג התחברות חדש)
+        if getattr(app, "RELOGIN", False):
+            continue
+        # אחרת – יציאה רגילה
+        break
+
 
